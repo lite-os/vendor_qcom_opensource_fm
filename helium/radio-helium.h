@@ -32,6 +32,7 @@ IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <stdbool.h>
 
+#define HELIUM_CMD_TIME_OUT (5)
 #define MIN_TX_TONE_VAL  0x00
 #define MAX_TX_TONE_VAL  0x07
 #define MIN_HARD_MUTE_VAL  0x00
@@ -98,18 +99,23 @@ IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 /**RDS CONFIG MODE**/
 #define FM_RDS_CNFG_MODE    0x0f
 #define FM_RDS_CNFG_LEN     0x10
+
+/**AF JUMP CONFIG MODE**/
+#define AF_ALGO_OFFSET      0
 #define AF_RMSSI_TH_OFFSET  1
 #define AF_RMSSI_SAMPLES_OFFSET 2
+#define AF_SINR_GD_CH_TH_OFFSET 4
+#define AF_SINR_TH_OFFSET   5
 /**RX CONFIG MODE**/
 #define FM_RX_CONFG_MODE    0x15
 #define FM_RX_CNFG_LEN      0x15
 #define GD_CH_RMSSI_TH_OFFSET   0x03
 #define MAX_GD_CH_RMSSI_TH  0x7F
-#define SRCH_ALGO_TYPE_OFFSET  0x00
-#define SINRFIRSTSTAGE_OFFSET  0x01
-#define RMSSIFIRSTSTAGE_OFFSET 0x02
-#define CF0TH12_BYTE1_OFFSET   0x03
-#define CF0TH12_BYTE2_OFFSET   0x04
+#define SRCH_ALGO_TYPE_OFFSET  0x02
+#define SINRFIRSTSTAGE_OFFSET  0x03
+#define RMSSIFIRSTSTAGE_OFFSET 0x04
+#define CF0TH12_BYTE1_OFFSET   0x00
+#define CF0TH12_BYTE2_OFFSET   0x01
 #define MAX_SINR_FIRSTSTAGE 0x7F
 #define MAX_RMSSI_FIRSTSTAGE    0x7F
 #define RDS_PS0_XFR_MODE 0x01
@@ -172,6 +178,7 @@ typedef void (*fm_set_blnd_cb) (int status);
 typedef void (*fm_get_stn_prm_cb) (int val, int status);
 typedef void (*fm_get_stn_dbg_prm_cb) (int val, int status);
 typedef void (*fm_enable_slimbus_cb) (int status);
+typedef void (*fm_enable_softmute_cb) (int status);
 
 typedef struct {
     size_t  size;
@@ -208,6 +215,7 @@ typedef struct {
     fm_get_stn_prm_cb fm_get_station_param_cb;
     fm_get_stn_dbg_prm_cb fm_get_station_debug_param_cb;
     fm_enable_slimbus_cb enable_slimbus_cb;
+    fm_enable_softmute_cb enable_softmute_cb;
 } fm_hal_callbacks_t;
 
 /* Opcode OCF */
@@ -1186,6 +1194,9 @@ struct radio_helium_device {
 #define CMD_DEFRD_CF0TH12           (7)
 #define CMD_DEFRD_TUNE_POWER        (8)
 #define CMD_DEFRD_REPEATCOUNT       (9)
+#define CMD_DEFRD_AF_ALGO           (10)
+#define CMD_DEFRD_AF_SINR_GD_CH_TH  (11)
+#define CMD_DEFRD_AF_SINR_TH        (12)
 
 #define CMD_STNPARAM_RSSI           (1)
 #define CMD_STNPARAM_SINR           (2)
@@ -1235,11 +1246,15 @@ int hci_fm_default_data_write_req(struct hci_fm_def_data_wr_req * data_wrt);
 int hci_fm_get_station_dbg_param_req();
 int hci_fm_get_station_cmd_param_req();
 int hci_fm_enable_slimbus(uint8_t enable);
+int hci_fm_enable_softmute(uint8_t enable);
 
 struct fm_hal_t {
     struct radio_helium_device *radio;
     fm_hal_callbacks_t *jni_cb;
     void *private_data;
+    pthread_mutex_t cmd_lock;
+    pthread_cond_t cmd_cond;
+    bool set_cmd_sent;
 };
 
 struct fm_interface_t {

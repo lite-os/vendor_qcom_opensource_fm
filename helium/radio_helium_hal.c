@@ -57,9 +57,12 @@ static uint32_t blend_tbl_mask_flag;
 static uint32_t station_param_mask_flag;
 static uint32_t station_dbg_param_mask_flag;
 uint64_t flag;
+static int slimbus_flag = 0;
 struct fm_hal_t *hal = NULL;
 
 #define LOG_TAG "radio_helium"
+#define WAIT_TIMEOUT 20000 /* 20*1000us */
+
 static void radio_hci_req_complete(char result)
 {
   ALOGD("%s:enetred %s", LOG_TAG, __func__);
@@ -79,6 +82,8 @@ static void hci_cc_fm_enable_rsp(char *ev_rsp)
         return;
     }
     rsp = (struct hci_fm_conf_rsp *)ev_rsp;
+    if (!slimbus_flag)
+        hal->jni_cb->thread_evt_cb(0);
     radio_hci_req_complete(rsp->status);
     hal->jni_cb->enabled_cb();
     if (rsp->status == FM_HC_STATUS_SUCCESS)
@@ -241,7 +246,14 @@ static void hci_cc_get_ch_det_threshold_rsp(char *ev_buff)
             val = hal->radio->ch_det_threshold.high_th;
     }
     clear_all_bit(ch_det_th_mask_flag);
-    hal->jni_cb->fm_get_ch_det_thr_cb(val, status);
+
+    if (!hal->set_cmd_sent)
+        hal->jni_cb->fm_get_ch_det_thr_cb(val, status);
+    else {
+        pthread_mutex_lock(&hal->cmd_lock);
+        pthread_cond_broadcast(&hal->cmd_cond);
+        pthread_mutex_unlock(&hal->cmd_lock);
+    }
 }
 
 static void hci_cc_set_ch_det_threshold_rsp(char *ev_buff)
@@ -282,32 +294,57 @@ static void hci_cc_default_data_read_rsp(char *ev_buff)
 
         if (test_bit(def_data_rd_mask_flag, CMD_DEFRD_AF_RMSSI_TH)) {
             val = hal->radio->def_data.data[AF_RMSSI_TH_OFFSET];
+            clear_bit(def_data_rd_mask_flag, CMD_DEFRD_AF_RMSSI_TH);
         } else if (test_bit(def_data_rd_mask_flag, CMD_DEFRD_AF_RMSSI_SAMPLE)) {
             val = hal->radio->def_data.data[AF_RMSSI_SAMPLES_OFFSET];
+            clear_bit(def_data_rd_mask_flag, CMD_DEFRD_AF_RMSSI_SAMPLE);
         } else if (test_bit(def_data_rd_mask_flag, CMD_DEFRD_GD_CH_RMSSI_TH)) {
             val = hal->radio->def_data.data[GD_CH_RMSSI_TH_OFFSET];
             if (val > MAX_GD_CH_RMSSI_TH)
                 val -= 256;
+            clear_bit(def_data_rd_mask_flag, CMD_DEFRD_GD_CH_RMSSI_TH);
         } else if (test_bit(def_data_rd_mask_flag, CMD_DEFRD_SEARCH_ALGO)) {
             val = hal->radio->def_data.data[SRCH_ALGO_TYPE_OFFSET];
+            clear_bit(def_data_rd_mask_flag, CMD_DEFRD_SEARCH_ALGO);
         } else if (test_bit(def_data_rd_mask_flag, CMD_DEFRD_SINR_FIRST_STAGE)) {
             val = hal->radio->def_data.data[SINRFIRSTSTAGE_OFFSET];
             if (val > MAX_SINR_FIRSTSTAGE)
                 val -= 256;
+            clear_bit(def_data_rd_mask_flag, CMD_DEFRD_SINR_FIRST_STAGE);
         } else if (test_bit(def_data_rd_mask_flag, CMD_DEFRD_RMSSI_FIRST_STAGE)) {
             val = hal->radio->def_data.data[RMSSIFIRSTSTAGE_OFFSET];
+            clear_bit(def_data_rd_mask_flag, CMD_DEFRD_RMSSI_FIRST_STAGE);
         } else if (test_bit(def_data_rd_mask_flag, CMD_DEFRD_CF0TH12)) {
             val = (hal->radio->def_data.data[CF0TH12_BYTE1_OFFSET] |
                     (hal->radio->def_data.data[CF0TH12_BYTE2_OFFSET] << 8));
+            clear_bit(def_data_rd_mask_flag, CMD_DEFRD_CF0TH12);
         } else if (test_bit(def_data_rd_mask_flag, CMD_DEFRD_TUNE_POWER)) {
+            clear_bit(def_data_rd_mask_flag, CMD_DEFRD_TUNE_POWER);
         } else if (test_bit(def_data_rd_mask_flag, CMD_DEFRD_REPEATCOUNT)) {
             val = hal->radio->def_data.data[RX_REPEATE_BYTE_OFFSET];
+            clear_bit(def_data_rd_mask_flag, CMD_DEFRD_REPEATCOUNT);
+        } else if(test_bit(def_data_rd_mask_flag, CMD_DEFRD_AF_ALGO)) {
+            val = hal->radio->def_data.data[AF_ALGO_OFFSET];
+            clear_bit(def_data_rd_mask_flag, CMD_DEFRD_AF_ALGO);
+        } else if (test_bit(def_data_rd_mask_flag, CMD_DEFRD_AF_SINR_GD_CH_TH)) {
+            val = hal->radio->def_data.data[AF_SINR_GD_CH_TH_OFFSET];
+            clear_bit(def_data_rd_mask_flag, CMD_DEFRD_AF_SINR_GD_CH_TH);
+        } else if (test_bit(def_data_rd_mask_flag, CMD_DEFRD_AF_SINR_TH)) {
+            val = hal->radio->def_data.data[AF_SINR_TH_OFFSET];
+            clear_bit(def_data_rd_mask_flag, CMD_DEFRD_AF_SINR_TH);
         }
     } else {
         ALOGE("%s: Error: Status= 0x%x", __func__, status);
     }
-    clear_all_bit(def_data_rd_mask_flag);
-    hal->jni_cb->fm_def_data_read_cb(val, status);
+    if (!hal->set_cmd_sent)
+        hal->jni_cb->fm_def_data_read_cb(val, status);
+    else {
+        pthread_mutex_lock(&hal->cmd_lock);
+        pthread_cond_broadcast(&hal->cmd_cond);
+        pthread_mutex_unlock(&hal->cmd_lock);
+    }
+
+
 }
 
 static void hci_cc_default_data_write_rsp(char *ev_buff)
@@ -333,18 +370,28 @@ static void hci_cc_get_blend_tbl_rsp(char *ev_buff)
         memcpy(&hal->radio->blend_tbl, &ev_buff[1],
                 sizeof(struct hci_fm_blend_table));
 
-        ALOGE("hci_cc_get_blend_tbl_rsp: data");
+        ALOGD("hci_cc_get_blend_tbl_rsp: data");
         int i;
         for (i = 0; i < 8; i++)
             ALOGE("data[%d] = 0x%x", i, ev_buff[1 + i]);
         if (test_bit(blend_tbl_mask_flag, CMD_BLENDTBL_SINR_HI)) {
             val = hal->radio->blend_tbl.BlendSinrHi;
+            ALOGE("%s: Sinrhi val = %d", LOG_TAG, val);
+            clear_bit(blend_tbl_mask_flag, CMD_BLENDTBL_SINR_HI);
         } else if (test_bit(blend_tbl_mask_flag, CMD_BLENDTBL_RMSSI_HI)) {
             val = hal->radio->blend_tbl.BlendRmssiHi;
+            ALOGE("%s: BlendRmssiHi val = %d", LOG_TAG, val);
+            clear_bit(blend_tbl_mask_flag, CMD_BLENDTBL_RMSSI_HI);
         }
     }
-    clear_all_bit(blend_tbl_mask_flag);
-    hal->jni_cb->fm_get_blend_cb(val, status);
+
+    if (!hal->set_cmd_sent)
+        hal->jni_cb->fm_get_blend_cb(val, status);
+    else {
+        pthread_mutex_lock(&hal->cmd_lock);
+        pthread_cond_broadcast(&hal->cmd_cond);
+        pthread_mutex_unlock(&hal->cmd_lock);
+    }
 }
 
 static void hci_cc_set_blend_tbl_rsp(char *ev_buff)
@@ -395,9 +442,16 @@ static void hci_cc_dbg_param_rsp(char *ev_buff)
 
 static void hci_cc_enable_slimbus_rsp(char *ev_buff)
 {
-    ALOGV("%s status %d", __func__, ev_buff[0]);
+    ALOGD("%s status %d", __func__, ev_buff[0]);
+    slimbus_flag = 1;
     hal->jni_cb->thread_evt_cb(0);
     hal->jni_cb->enable_slimbus_cb(ev_buff[0]);
+}
+
+static void hci_cc_enable_softmute_rsp(char *ev_buff)
+{
+    ALOGD("%s status %d", __func__, ev_buff[0]);
+    hal->jni_cb->enable_softmute_cb(ev_buff[0]);
 }
 
 static inline void hci_cmd_complete_event(char *buff)
@@ -428,6 +482,8 @@ static inline void hci_cmd_complete_event(char *buff)
 
     case hci_recv_ctrl_cmd_op_pack(HCI_OCF_FM_SET_RECV_CONF_REQ):
     case hci_recv_ctrl_cmd_op_pack(HCI_OCF_FM_SET_MUTE_MODE_REQ):
+            hci_cc_enable_softmute_rsp(pbuf);
+            break; 
     case hci_recv_ctrl_cmd_op_pack(HCI_OCF_FM_SET_STEREO_MODE_REQ):
     case hci_recv_ctrl_cmd_op_pack(HCI_OCF_FM_SET_ANTENNA):
     case hci_recv_ctrl_cmd_op_pack(HCI_OCF_FM_SET_SIGNAL_THRESHOLD):
@@ -1042,11 +1098,22 @@ int process_event(void *hal, unsigned char *evt_buf)
 int fm_hci_close_done()
 {
     ALOGI("fm_hci_close_done");
+    fm_hal_callbacks_t *ptr = NULL;
+
     if(hal != NULL){
+        ptr = hal->jni_cb;
+        ALOGI("clearing hal ");
+        free(hal->radio);
+        hal->radio = NULL;
+        hal->jni_cb = NULL;
+        pthread_cond_destroy(&hal->cmd_cond);
+        pthread_mutex_destroy(&hal->cmd_lock);
+        free(hal);
+        hal = NULL;
+
         ALOGI("Notifying FM OFF to JNI");
-        hal->radio->mode = FM_OFF;
-        hal->jni_cb->disabled_cb();
-        hal->jni_cb->thread_evt_cb(1);
+        ptr->disabled_cb();
+        ptr->thread_evt_cb(1);
     }
     return 0;
 }
@@ -1146,6 +1213,59 @@ int set_low_power_mode(int lp_mode)
     return retval;
 }
 
+static int helium_send_hci_cmd(int cmd, void *cmd_param)
+{
+    int ret = FM_HC_STATUS_FAIL;
+    struct timespec ts;
+    struct hci_fm_default_data_read_req *rd;
+
+    pthread_mutex_lock(&(hal->cmd_lock));
+    hal->set_cmd_sent = true;
+    switch (cmd) {
+        case HCI_FM_HELIUM_SINR_SAMPLES:
+        case HCI_FM_HELIUM_SINR_THRESHOLD:
+        case HCI_FM_HELIUM_INTF_LOW_THRESHOLD:
+        case HCI_FM_HELIUM_INTF_HIGH_THRESHOLD:
+            ret = hci_fm_get_ch_det_th();
+            break;
+        case HCI_FM_HELIUM_SINRFIRSTSTAGE:
+        case HCI_FM_HELIUM_RMSSIFIRSTSTAGE:
+        case HCI_FM_HELIUM_CF0TH12:
+        case HCI_FM_HELIUM_SRCHALGOTYPE:
+        case HCI_FM_HELIUM_AF_RMSSI_TH:
+        case HCI_FM_HELIUM_GOOD_CH_RMSSI_TH:
+        case HCI_FM_HELIUM_AF_RMSSI_SAMPLES:
+        case HCI_FM_HELIUM_RXREPEATCOUNT:
+        case HCI_FM_HELIUM_AF_ALGO:
+        case HCI_FM_HELIUM_AF_SINR_GD_CH_TH:
+        case HCI_FM_HELIUM_AF_SINR_TH:
+            rd = (struct hci_fm_default_data_read_req *) cmd_param;
+            ret = hci_fm_default_data_read_req(rd);
+            break;
+        case HCI_FM_HELIUM_BLEND_SINRHI:
+            ret = hci_fm_get_blend_req();
+            break;
+        case HCI_FM_HELIUM_BLEND_RMSSIHI:
+            ret = hci_fm_get_blend_req();
+            break;
+    }
+    if (ret == FM_HC_STATUS_SUCCESS) {
+        if ((ret = clock_gettime(CLOCK_REALTIME, &ts)) == 0) {
+            ts.tv_sec += HELIUM_CMD_TIME_OUT;
+            ALOGD("%s:waiting for cmd %d response ", LOG_TAG, cmd);
+            ret = pthread_cond_timedwait(&hal->cmd_cond, &hal->cmd_lock,
+                    &ts);
+            ALOGD("%s: received %d cmd response.", LOG_TAG, cmd);
+        } else {
+            ALOGE("%s: clock gettime failed. err = %d(%s)", LOG_TAG,
+                    errno, strerror(errno));
+        }
+    }
+    hal->set_cmd_sent = false;
+    pthread_mutex_unlock(&hal->cmd_lock);
+
+    return ret;
+}
 
 /* Callback function to be registered with FM-HCI for event notification */
 static struct fm_hci_callbacks_t hal_cb = {
@@ -1155,12 +1275,29 @@ static struct fm_hci_callbacks_t hal_cb = {
 
 int hal_init(fm_hal_callbacks_t *cb)
 {
-    int ret = -FM_HC_STATUS_FAIL;
+    int ret = -FM_HC_STATUS_FAIL, i;
     fm_hci_hal_t hci_hal;
 
     ALOGD("++%s", __func__);
 
     memset(&hci_hal, 0, sizeof(fm_hci_hal_t));
+
+    if (hal) {
+        ALOGE("%s:HAL is still available from the last session, please wait for sometime", __func__);
+        for(i=0; i<10; i++) {
+            if (!hal) {
+                break;
+            } else {
+                usleep(WAIT_TIMEOUT);
+            }
+        }
+    }
+
+    if (hal) {
+        ALOGE("%s:Last FM session didnot end properly, please launch again", __func__);
+        hal = NULL;
+        return ret;
+    }
 
     hal = malloc(sizeof(struct fm_hal_t));
     if (!hal) {
@@ -1170,6 +1307,11 @@ int hal_init(fm_hal_callbacks_t *cb)
     }
     memset(hal, 0, sizeof(struct fm_hal_t));
     hal->jni_cb = cb;
+
+    pthread_mutex_init(&hal->cmd_lock, NULL);
+    pthread_cond_init(&hal->cmd_cond, NULL);
+    hal->set_cmd_sent = false;
+
     hal->radio = malloc(sizeof(struct radio_helium_device));
     if (!hal->radio) {
         ALOGE("%s:Failed to allocate memory for device", __func__);
@@ -1199,6 +1341,8 @@ out:
             hal->radio = NULL;
         }
         hal->jni_cb = NULL;
+        pthread_cond_destroy(&hal->cmd_cond);
+        pthread_mutex_destroy(&hal->cmd_lock);
         free(hal);
         hal = NULL;
     }
@@ -1214,6 +1358,7 @@ static int set_fm_ctrl(int cmd, int val)
     unsigned int rds_grps_proc = 0;
     char *data;
     struct hci_fm_def_data_wr_req def_data_wrt;
+    struct hci_fm_def_data_rd_req def_data_rd;
 
     if (!hal) {
         ALOGE("%s:ALERT: command sent before hal init", __func__);
@@ -1501,7 +1646,12 @@ static int set_fm_ctrl(int cmd, int val)
              ret = -1;
              goto end;
          }
-         hal->radio->ch_det_threshold.sinr_samples = val;
+         ret = helium_send_hci_cmd(cmd, NULL);
+         if (ret != FM_HC_STATUS_SUCCESS) {
+             ALOGE("%s: 0x%x cmd failed", LOG_TAG, cmd);
+             goto end;
+         }
+         hal->radio->ch_det_threshold.sinr_samples = (char)val;
          ret = set_ch_det_thresholds_req(&hal->radio->ch_det_threshold);
          if (ret < 0) {
              ALOGE("Failed to set SINR samples  %d", ret);
@@ -1514,7 +1664,12 @@ static int set_fm_ctrl(int cmd, int val)
              ret = -1;
              goto end;
          }
-         hal->radio->ch_det_threshold.sinr = val;
+         ret = helium_send_hci_cmd(cmd, NULL);
+         if (ret != FM_HC_STATUS_SUCCESS) {
+             ALOGE("%s: 0x%x cmd failed", LOG_TAG, cmd);
+             goto end;
+         }
+         hal->radio->ch_det_threshold.sinr = (char)val;
          ret = set_ch_det_thresholds_req(&hal->radio->ch_det_threshold);
          break;
     case HCI_FM_HELIUM_INTF_LOW_THRESHOLD:
@@ -1523,7 +1678,12 @@ static int set_fm_ctrl(int cmd, int val)
              ret = -1;
              goto end;
          }
-         hal->radio->ch_det_threshold.low_th = val;
+         ret = helium_send_hci_cmd(cmd, NULL);
+         if (ret != FM_HC_STATUS_SUCCESS) {
+             ALOGE("%s: 0x%x cmd failed", LOG_TAG, cmd);
+             goto end;
+         }
+         hal->radio->ch_det_threshold.low_th = (char)val;
          ret = set_ch_det_thresholds_req(&hal->radio->ch_det_threshold);
          break;
     case HCI_FM_HELIUM_INTF_HIGH_THRESHOLD:
@@ -1532,10 +1692,25 @@ static int set_fm_ctrl(int cmd, int val)
              ret = -1;
              goto end;
          }
-         hal->radio->ch_det_threshold.high_th = val;
+         ret = helium_send_hci_cmd(cmd, NULL);
+         if (ret != FM_HC_STATUS_SUCCESS) {
+             ALOGE("%s: 0x%x cmd failed", LOG_TAG, cmd);
+             goto end;
+         }
+         hal->radio->ch_det_threshold.high_th = (char)val;
          ret = set_ch_det_thresholds_req(&hal->radio->ch_det_threshold);
          break;
     case HCI_FM_HELIUM_SINRFIRSTSTAGE:
+         def_data_rd.mode = FM_SRCH_CONFG_MODE;
+         def_data_rd.length = FM_SRCH_CNFG_LEN;
+         def_data_rd.param_len = 0;
+         def_data_rd.param = 0;
+
+         ret = helium_send_hci_cmd(cmd, (void *)&def_data_rd);
+         if (ret != FM_HC_STATUS_SUCCESS) {
+             ALOGE("%s: 0x%x cmd failed", LOG_TAG, cmd);
+             goto end;
+         }
          def_data_wrt.mode = FM_SRCH_CONFG_MODE;
          def_data_wrt.length = FM_SRCH_CNFG_LEN;
          memcpy(&def_data_wrt.data, &hal->radio->def_data.data,
@@ -1544,6 +1719,16 @@ static int set_fm_ctrl(int cmd, int val)
          ret = hci_fm_default_data_write_req(&def_data_wrt);
          break;
     case HCI_FM_HELIUM_RMSSIFIRSTSTAGE:
+         def_data_rd.mode = FM_SRCH_CONFG_MODE;
+         def_data_rd.length = FM_SRCH_CNFG_LEN;
+         def_data_rd.param_len = 0;
+         def_data_rd.param = 0;
+
+         ret = helium_send_hci_cmd(cmd, (void *)&def_data_rd);
+         if (ret != FM_HC_STATUS_SUCCESS) {
+             ALOGE("%s: 0x%x cmd failed", LOG_TAG, cmd);
+             goto end;
+         }
          def_data_wrt.mode = FM_SRCH_CONFG_MODE;
          def_data_wrt.length = FM_SRCH_CNFG_LEN;
          memcpy(&def_data_wrt.data, &hal->radio->def_data.data,
@@ -1552,6 +1737,16 @@ static int set_fm_ctrl(int cmd, int val)
          ret = hci_fm_default_data_write_req(&def_data_wrt);
          break;
     case HCI_FM_HELIUM_CF0TH12:
+         def_data_rd.mode = FM_SRCH_CONFG_MODE;
+         def_data_rd.length = FM_SRCH_CNFG_LEN;
+         def_data_rd.param_len = 0;
+         def_data_rd.param = 0;
+
+         ret = helium_send_hci_cmd(cmd, (void *)&def_data_rd);
+         if (ret != FM_HC_STATUS_SUCCESS) {
+             ALOGE("%s: 0x%x cmd failed", LOG_TAG, cmd);
+             goto end;
+         }
          def_data_wrt.mode = FM_SRCH_CONFG_MODE;
          def_data_wrt.length = FM_SRCH_CNFG_LEN;
          memcpy(&def_data_wrt.data, &hal->radio->def_data.data,
@@ -1561,6 +1756,16 @@ static int set_fm_ctrl(int cmd, int val)
          ret = hci_fm_default_data_write_req(&def_data_wrt);
          break;
     case HCI_FM_HELIUM_SRCHALGOTYPE:
+         def_data_rd.mode = FM_SRCH_CONFG_MODE;
+         def_data_rd.length = FM_SRCH_CNFG_LEN;
+         def_data_rd.param_len = 0;
+         def_data_rd.param = 0;
+
+         ret = helium_send_hci_cmd(cmd, (void *)&def_data_rd);
+         if (ret != FM_HC_STATUS_SUCCESS) {
+             ALOGE("%s: 0x%x cmd failed", LOG_TAG, cmd);
+             goto end;
+         }
          def_data_wrt.mode = FM_SRCH_CONFG_MODE;
          def_data_wrt.length = FM_SRCH_CNFG_LEN;
          memcpy(&def_data_wrt.data, &hal->radio->def_data.data,
@@ -1569,6 +1774,16 @@ static int set_fm_ctrl(int cmd, int val)
          ret = hci_fm_default_data_write_req(&def_data_wrt);
          break;
     case HCI_FM_HELIUM_AF_RMSSI_TH:
+         def_data_rd.mode = FM_AFJUMP_CONFG_MODE;
+         def_data_rd.length = FM_AFJUMP_CNFG_LEN;
+         def_data_rd.param_len = 0;
+         def_data_rd.param = 0;
+
+         ret = helium_send_hci_cmd(cmd, (void *)&def_data_rd);
+         if (ret != FM_HC_STATUS_SUCCESS) {
+             ALOGE("%s: 0x%x cmd failed", LOG_TAG, cmd);
+             goto end;
+         }
          def_data_wrt.mode = FM_AFJUMP_CONFG_MODE;
          def_data_wrt.length = FM_AFJUMP_CNFG_LEN;
          memcpy(&def_data_wrt.data, &hal->radio->def_data.data,
@@ -1577,6 +1792,16 @@ static int set_fm_ctrl(int cmd, int val)
          ret = hci_fm_default_data_write_req(&def_data_wrt);
          break;
     case HCI_FM_HELIUM_GOOD_CH_RMSSI_TH:
+         def_data_rd.mode = FM_AFJUMP_CONFG_MODE;
+         def_data_rd.length = FM_AFJUMP_CNFG_LEN;
+         def_data_rd.param_len = 0;
+         def_data_rd.param = 0;
+
+         ret = helium_send_hci_cmd(cmd, (void *)&def_data_rd);
+         if (ret != FM_HC_STATUS_SUCCESS) {
+             ALOGE("%s: 0x%x cmd failed", LOG_TAG, cmd);
+             goto end;
+         }
          def_data_wrt.mode = FM_AFJUMP_CONFG_MODE;
          def_data_wrt.length = FM_AFJUMP_CNFG_LEN;
          memcpy(&def_data_wrt.data, &hal->radio->def_data.data,
@@ -1585,6 +1810,16 @@ static int set_fm_ctrl(int cmd, int val)
          ret = hci_fm_default_data_write_req(&def_data_wrt);
          break;
     case HCI_FM_HELIUM_AF_RMSSI_SAMPLES:
+         def_data_rd.mode = FM_AFJUMP_CONFG_MODE;
+         def_data_rd.length = FM_AFJUMP_CNFG_LEN;
+         def_data_rd.param_len = 0;
+         def_data_rd.param = 0;
+
+         ret = helium_send_hci_cmd(cmd, (void *)&def_data_rd);
+         if (ret != FM_HC_STATUS_SUCCESS) {
+             ALOGE("%s: 0x%x cmd failed", LOG_TAG, cmd);
+             goto end;
+         }
          def_data_wrt.mode = FM_AFJUMP_CONFG_MODE;
          def_data_wrt.length = FM_AFJUMP_CNFG_LEN;
          memcpy(&def_data_wrt.data, &hal->radio->def_data.data,
@@ -1593,11 +1828,75 @@ static int set_fm_ctrl(int cmd, int val)
          ret = hci_fm_default_data_write_req(&def_data_wrt);
          break;
     case HCI_FM_HELIUM_RXREPEATCOUNT:
+         def_data_rd.mode = RDS_PS0_XFR_MODE;
+         def_data_rd.length = RDS_PS0_LEN;
+         def_data_rd.param_len = 0;
+         def_data_rd.param = 0;
+
+         ret = helium_send_hci_cmd(cmd, (void *)&def_data_rd);
+         if (ret != FM_HC_STATUS_SUCCESS) {
+             ALOGE("%s: 0x%x cmd failed", LOG_TAG, cmd);
+             goto end;
+         }
          def_data_wrt.mode = RDS_PS0_XFR_MODE;
          def_data_wrt.length = RDS_PS0_LEN;
          memcpy(&def_data_wrt.data, &hal->radio->def_data.data,
                  hal->radio->def_data.data_len);
-         def_data_wrt.data[AF_RMSSI_SAMPLES_OFFSET] = val;
+         def_data_wrt.data[RX_REPEATE_BYTE_OFFSET] = val;
+         ret = hci_fm_default_data_write_req(&def_data_wrt);
+         break;
+    case HCI_FM_HELIUM_AF_ALGO:
+         def_data_rd.mode = FM_AFJUMP_CONFG_MODE;
+         def_data_rd.length = FM_AFJUMP_CNFG_LEN;
+         def_data_rd.param_len = 0;
+         def_data_rd.param = 0;
+
+         ret = helium_send_hci_cmd(cmd, (void *)&def_data_rd);
+         if (ret != FM_HC_STATUS_SUCCESS) {
+             ALOGE("%s: 0x%x cmd failed", LOG_TAG, cmd);
+             goto end;
+         }
+         def_data_wrt.mode = FM_AFJUMP_CONFG_MODE;
+         def_data_wrt.length = FM_AFJUMP_CNFG_LEN;
+         memcpy(&def_data_wrt.data, &hal->radio->def_data.data,
+                 hal->radio->def_data.data_len);
+         def_data_wrt.data[AF_ALGO_OFFSET] = (char)val;
+         ret = hci_fm_default_data_write_req(&def_data_wrt);
+         break;
+    case HCI_FM_HELIUM_AF_SINR_GD_CH_TH:
+         def_data_rd.mode = FM_AFJUMP_CONFG_MODE;
+         def_data_rd.length = FM_AFJUMP_CNFG_LEN;
+         def_data_rd.param_len = 0;
+         def_data_rd.param = 0;
+
+         ret = helium_send_hci_cmd(cmd, (void *)&def_data_rd);
+         if (ret != FM_HC_STATUS_SUCCESS) {
+             ALOGE("%s: 0x%x cmd failed", LOG_TAG, cmd);
+             goto end;
+         }
+         def_data_wrt.mode = FM_AFJUMP_CONFG_MODE;
+         def_data_wrt.length = FM_AFJUMP_CNFG_LEN;
+         memcpy(&def_data_wrt.data, &hal->radio->def_data.data,
+                 hal->radio->def_data.data_len);
+         def_data_wrt.data[AF_SINR_GD_CH_TH_OFFSET] = (char)val;
+         ret = hci_fm_default_data_write_req(&def_data_wrt);
+         break;
+    case HCI_FM_HELIUM_AF_SINR_TH:
+         def_data_rd.mode = FM_AFJUMP_CONFG_MODE;
+         def_data_rd.length = FM_AFJUMP_CNFG_LEN;
+         def_data_rd.param_len = 0;
+         def_data_rd.param = 0;
+
+         ret = helium_send_hci_cmd(cmd, (void *)&def_data_rd);
+         if (ret != FM_HC_STATUS_SUCCESS) {
+             ALOGE("%s: 0x%x cmd failed", LOG_TAG, cmd);
+             goto end;
+         }
+         def_data_wrt.mode = FM_AFJUMP_CONFG_MODE;
+         def_data_wrt.length = FM_AFJUMP_CNFG_LEN;
+         memcpy(&def_data_wrt.data, &hal->radio->def_data.data,
+                 hal->radio->def_data.data_len);
+         def_data_wrt.data[AF_SINR_TH_OFFSET] = (char)val;
          ret = hci_fm_default_data_write_req(&def_data_wrt);
          break;
     case HCI_FM_HELIUM_BLEND_SINRHI:
@@ -1606,7 +1905,13 @@ static int set_fm_ctrl(int cmd, int val)
              ret = -1;
              goto end;
          }
-         hal->radio->blend_tbl.BlendSinrHi = val;
+         ret = helium_send_hci_cmd(cmd, NULL);
+         if (ret != FM_HC_STATUS_SUCCESS) {
+             ALOGE("%s: 0x%x cmd failed", LOG_TAG, cmd);
+             goto end;
+         }
+
+         hal->radio->blend_tbl.BlendSinrHi = (char)val;
          ret = hci_fm_set_blend_tbl_req(&hal->radio->blend_tbl);
          break;
     case HCI_FM_HELIUM_BLEND_RMSSIHI:
@@ -1615,13 +1920,19 @@ static int set_fm_ctrl(int cmd, int val)
              ret = -1;
              goto end;
          }
-         hal->radio->blend_tbl.BlendRmssiHi = val;
+         ret = helium_send_hci_cmd(cmd, NULL);
+         if (ret != FM_HC_STATUS_SUCCESS) {
+             ALOGE("%s: 0x%x cmd failed", LOG_TAG, cmd);
+             goto end;
+         }
+
+         hal->radio->blend_tbl.BlendRmssiHi = (char)val;
          ret = hci_fm_set_blend_tbl_req(&hal->radio->blend_tbl);
          break;
     case HCI_FM_HELIUM_ENABLE_LPF:
          ALOGI("%s: val: %x", __func__, val);
          if (!(ret = hci_fm_enable_lpf(val))) {
-             ALOGI("%s: command sent sucessfully", __func__, val);
+             ALOGI("%s: command sent sucessfully", __func__);
          }
          break;
     case HCI_FM_HELIUM_AUDIO:
@@ -1635,7 +1946,7 @@ static int set_fm_ctrl(int cmd, int val)
     }
 end:
     if (ret < 0)
-        ALOGE("%s:%s: %d cmd failed", LOG_TAG, __func__, cmd);
+        ALOGE("%s:%s: 0x%x cmd failed", LOG_TAG, __func__, cmd);
     return ret;
 }
 
@@ -1729,7 +2040,21 @@ static int get_fm_ctrl(int cmd, int *val)
         set_bit(def_data_rd_mask_flag, CMD_DEFRD_AF_RMSSI_SAMPLE);
         def_data_rd.mode = FM_AFJUMP_CONFG_MODE;
         def_data_rd.length = FM_AFJUMP_CNFG_LEN;
-
+        goto cmd;
+    case HCI_FM_HELIUM_AF_ALGO:
+        set_bit(def_data_rd_mask_flag, CMD_DEFRD_AF_ALGO);
+        def_data_rd.mode = FM_AFJUMP_CONFG_MODE;
+        def_data_rd.length = FM_AFJUMP_CNFG_LEN;
+        goto cmd;
+    case HCI_FM_HELIUM_AF_SINR_GD_CH_TH:
+        set_bit(def_data_rd_mask_flag, CMD_DEFRD_AF_SINR_GD_CH_TH);
+        def_data_rd.mode = FM_AFJUMP_CONFG_MODE;
+        def_data_rd.length = FM_AFJUMP_CNFG_LEN;
+        goto cmd;
+    case HCI_FM_HELIUM_AF_SINR_TH:
+        set_bit(def_data_rd_mask_flag, CMD_DEFRD_AF_SINR_TH);
+        def_data_rd.mode = FM_AFJUMP_CONFG_MODE;
+        def_data_rd.length = FM_AFJUMP_CNFG_LEN;
 cmd:
         def_data_rd.param_len = 0;
         def_data_rd.param = 0;
@@ -1754,6 +2079,7 @@ cmd:
         ret = hci_fm_get_blend_req();
         if (ret != FM_HC_STATUS_SUCCESS)
             clear_bit(blend_tbl_mask_flag, CMD_BLENDTBL_SINR_HI);
+        break;
     case HCI_FM_HELIUM_BLEND_RMSSIHI:
         set_bit(blend_tbl_mask_flag, CMD_BLENDTBL_RMSSI_HI);
         ret = hci_fm_get_blend_req();
