@@ -9,6 +9,7 @@ ConfigFmThs.cpp \
 FmIoctlsInterface.cpp \
 FmPerformanceParams.cpp
 
+LOCAL_CFLAGS += -Wno-error
 ifeq ($(BOARD_HAS_QCA_FM_SOC), "cherokee")
 LOCAL_CFLAGS += -DFM_SOC_TYPE_CHEROKEE
 endif
