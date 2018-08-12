@@ -12,6 +12,8 @@ LOCAL_SRC_FILES := \
     FmRadioController.cpp \
     LibfmJni.cpp
 
+LOCAL_CFLAGS += -Wno-error
+
 LOCAL_C_INCLUDES := $(JNI_H_INCLUDE) \
     frameworks/base/core/jni/include \
     frameworks/base/include/media
